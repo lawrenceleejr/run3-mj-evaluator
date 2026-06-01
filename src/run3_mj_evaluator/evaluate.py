@@ -152,61 +152,68 @@ def run_spanet(session, source, mask):
 # CombinatorialSolver
 # ---------------------------------------------------------------------------
 
-def _build_6jet_assignment_tables():
-    """(10, 3) index arrays mapping 10 possible partitions of 6 jets into two triplets."""
-    all_jets = list(range(6))
-    seen, g1_list, g2_list = set(), [], []
-    for g1 in combinations(all_jets, 3):
-        g2    = tuple(j for j in all_jets if j not in g1)
-        canon = (min(g1, g2), max(g1, g2))
-        if canon not in seen:
-            seen.add(canon)
-            g1_list.append(list(canon[0]))
-            g2_list.append(list(canon[1]))
+def _build_7jet_assignment_tables():
+    """(70, 3) index arrays for the 7-jet CombinatorialSolver output ordering.
+
+    Output logits have shape (batch, 70) = 7 ISR choices x 10 unique 3+3 partitions
+    of the remaining 6 jets. Ordering matches CombinatorialSolver's
+    ``enumerate_assignments(7)``: outer loop over ISR jet, inner over groupings.
+    """
+    g1_list, g2_list = [], []
+    for isr in range(7):
+        remaining = [j for j in range(7) if j != isr]
+        seen = set()
+        for g1 in combinations(remaining, 3):
+            g2    = tuple(j for j in remaining if j not in g1)
+            canon = (min(g1, g2), max(g1, g2))
+            if canon not in seen:
+                seen.add(canon)
+                g1_list.append(list(canon[0]))
+                g2_list.append(list(canon[1]))
     return np.array(g1_list, dtype=int), np.array(g2_list, dtype=int)
 
 
-_COMB_G1, _COMB_G2 = _build_6jet_assignment_tables()  # each (10, 3)
+_COMB_G1, _COMB_G2 = _build_7jet_assignment_tables()  # each (70, 3)
 
 
 def prepare_comb_input(pt, eta, phi, e, px, py, pz, mask):
-    """Select top-6 pT jets and build (N, 6, 4) inputs for CombinatorialSolver.
+    """Select top-7 pT jets and build (N, 7, 4) inputs for CombinatorialSolver.
 
     Returns
     -------
-    input_norm : (N, 6, 4) float32  — HT-normalised (E, px, py, pz) for the ML model
-    input_raw  : (N, 6, 4) float32  — physical units for the classical solver
-    spher_6jet : (N, 6, 4) float64  — (pt, eta, phi, e) in original units
-    top6_idx   : (N, 6) int         — positions in the original J-jet array
+    input_norm : (N, 7, 4) float32  — HT-normalised (E, px, py, pz) for the ML model
+    input_raw  : (N, 7, 4) float32  — physical units for the classical solver
+    spher_7jet : (N, 7, 4) float64  — (pt, eta, phi, e) in original units
+    top7_idx   : (N, 7) int         — positions in the original J-jet array
     """
     N = pt.shape[0]
     ht = np.where(mask, pt, 0.0).sum(axis=1, keepdims=True).clip(min=1e-6)
 
     pt_masked = np.where(mask, pt, -np.inf)
-    top6_idx  = np.argsort(-pt_masked, axis=1)[:, :6]  # (N, 6)
+    top7_idx  = np.argsort(-pt_masked, axis=1)[:, :7]  # (N, 7)
 
     rows = np.arange(N)[:, None]
-    e6   = e  [rows, top6_idx]
-    px6  = px [rows, top6_idx]
-    py6  = py [rows, top6_idx]
-    pz6  = pz [rows, top6_idx]
-    pt6  = pt [rows, top6_idx]
-    eta6 = eta[rows, top6_idx]
-    phi6 = phi[rows, top6_idx]
+    e7   = e  [rows, top7_idx]
+    px7  = px [rows, top7_idx]
+    py7  = py [rows, top7_idx]
+    pz7  = pz [rows, top7_idx]
+    pt7  = pt [rows, top7_idx]
+    eta7 = eta[rows, top7_idx]
+    phi7 = phi[rows, top7_idx]
 
-    epxpypz    = np.stack([e6, px6, py6, pz6], axis=-1)
+    epxpypz    = np.stack([e7, px7, py7, pz7], axis=-1)
     input_norm = (epxpypz / ht[:, :, None]).astype(np.float32)
     input_raw  = epxpypz.astype(np.float32)
-    spher_6jet = np.stack([pt6, eta6, phi6, e6], axis=-1)
+    spher_7jet = np.stack([pt7, eta7, phi7, e7], axis=-1)
 
-    return input_norm, input_raw, spher_6jet, top6_idx
+    return input_norm, input_raw, spher_7jet, top7_idx
 
 
 def run_comb_solver(session, model_input):
     """Run a CombinatorialSolver session one event at a time (batch_size=1 baked in ONNX).
 
-    model_input : (N, 6, 4) float32
-    Returns t1_idx, t2_idx each (N, 3) int — indices into the 6-jet array.
+    model_input : (N, 7, 4) float32
+    Returns t1_idx, t2_idx each (N, 3) int — indices into the 7-jet array.
     """
     N    = model_input.shape[0]
     best = np.empty(N, dtype=int)
@@ -319,13 +326,13 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
                     elif mtype == "comb_solver":
                         if comb_prepped is None:
                             comb_prepped = prepare_comb_input(pt, eta, phi, e, px, py, pz, mask)
-                        comb_norm, comb_raw, _spher_6j, top6_idx = comb_prepped
+                        comb_norm, comb_raw, _spher_7j, top7_idx = comb_prepped
                         comb_in = comb_norm if model_cfg["normalized"] else comb_raw
-                        t1_6, t2_6 = run_comb_solver(session, comb_in)
-                        # Remap 6-jet indices → original padded-jet indices
+                        t1_7, t2_7 = run_comb_solver(session, comb_in)
+                        # Remap 7-jet indices → original padded-jet indices
                         rows   = np.arange(n_chunk)[:, None]
-                        t1_idx = top6_idx[rows, t1_6]  # (N, 3)
-                        t2_idx = top6_idx[rows, t2_6]  # (N, 3)
+                        t1_idx = top7_idx[rows, t1_7]  # (N, 3)
+                        t2_idx = top7_idx[rows, t2_7]  # (N, 3)
 
                     pt1, eta1, phi1, m1 = candidate_fourvec(pt, eta, phi, e, t1_idx)
                     pt2, eta2, phi2, m2 = candidate_fourvec(pt, eta, phi, e, t2_idx)

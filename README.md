@@ -46,7 +46,7 @@ python evaluate.py input.root output.root config.json --tree events --chunk-size
 | `type` | Description | Required extra keys |
 |---|---|---|
 | `spanet` | SPANet ONNX model — batched inference, takes `(N, J, 4)` source + `(N, J)` mask | `input_format`: `"cart"` (px,py,pz,e) or `"spher"` (pt,eta,phi,e) |
-| `comb_solver` | CombinatorialSolver ONNX — run one event at a time (batch=1 baked into graph), takes top-6 pT jets as `(1, 6, 4)` (E,px,py,pz) | `normalized`: `true` (divide by HT) or `false` (raw units) |
+| `comb_solver` | CombinatorialSolver ONNX — run one event at a time (batch=1 baked into graph), takes top-7 pT jets as `(1, 7, 4)` (E,px,py,pz) | `normalized`: `true` (divide by HT) or `false` (raw units) |
 
 ## Output ROOT file structure
 
