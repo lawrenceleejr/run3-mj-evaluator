@@ -103,15 +103,15 @@ def _mask_from_lengths(lengths, max_len):
 
 def chunk_to_numpy(chunk):
     """Convert one uproot chunk to padded (N, J) float64 arrays + bool mask."""
-    jets   = chunk[_JET_BRANCH]
-    n_jets = ak.to_numpy(ak.num(jets["pt"], axis=1))
+    pt_branch = f"{_JET_BRANCH}_pt"
+    n_jets = ak.to_numpy(ak.num(chunk[pt_branch], axis=1))
     max_j  = int(n_jets.max()) if len(n_jets) > 0 else 0
 
     mask = _mask_from_lengths(n_jets, max_j)
-    pt   = _padded(jets["pt"],  max_j)
-    eta  = _padded(jets["eta"], max_j)
-    phi  = _padded(jets["phi"], max_j)
-    m    = _padded(jets["m"],   max_j)
+    pt   = _padded(chunk[f"{_JET_BRANCH}_pt"],  max_j)
+    eta  = _padded(chunk[f"{_JET_BRANCH}_eta"], max_j)
+    phi  = _padded(chunk[f"{_JET_BRANCH}_phi"], max_j)
+    m    = _padded(chunk[f"{_JET_BRANCH}_m"],   max_j)
 
     px = pt * np.cos(phi)
     py = pt * np.sin(phi)
@@ -281,8 +281,8 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
         tree      = in_file[in_tree_name]
         tree_keys = set(tree.keys())
 
-        if _JET_BRANCH not in tree_keys:
-            sys.exit(f"Branch '{_JET_BRANCH}' not found in tree '{in_tree_name}'.")
+        if f"{_JET_BRANCH}_pt" not in tree_keys:
+            sys.exit(f"Branch '{_JET_BRANCH}_pt' not found in tree '{in_tree_name}'.")
 
         total_in = total_out = 0
 
@@ -295,8 +295,21 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
 
                 pt, eta, phi, px, py, pz, e, mask = chunk_to_numpy(chunk)
 
-                # Precompute comb-solver inputs once per chunk (shared across models)
-                comb_prepped = None
+                # Both model types operate on the leading 6 pT jets.
+                # Select them once per chunk and share across all models.
+                comb_norm, comb_raw, _spher_6j, top6_idx = prepare_comb_input(
+                    pt, eta, phi, e, px, py, pz, mask
+                )
+                rows6 = np.arange(n_chunk)[:, None]
+                pt6   = pt [rows6, top6_idx]
+                eta6  = eta[rows6, top6_idx]
+                phi6  = phi[rows6, top6_idx]
+                e6    = e  [rows6, top6_idx]
+                px6   = px [rows6, top6_idx]
+                py6   = py [rows6, top6_idx]
+                pz6   = pz [rows6, top6_idx]
+                # Slimmer guarantees ≥6 jets, so mask is all-True for the top-6 window.
+                mask6 = np.ones((n_chunk, 6), dtype=bool)
 
                 out_record = {}
 
@@ -310,22 +323,18 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
 
                     if mtype == "spanet":
                         if model_cfg["input_format"] == "cart":
-                            source = np.stack([px, py, pz, e], axis=-1).astype(np.float32)
+                            source = np.stack([px6, py6, pz6, e6], axis=-1).astype(np.float32)
                         else:
-                            source = np.stack([pt, eta, phi, e], axis=-1).astype(np.float32)
-                        t1_idx, t2_idx = run_spanet(session, source, mask)
-                        # t1_idx / t2_idx are (N, 3) indices into the padded J-jet array
+                            source = np.stack([pt6, eta6, phi6, e6], axis=-1).astype(np.float32)
+                        t1_6, t2_6 = run_spanet(session, source, mask6)
 
                     elif mtype == "comb_solver":
-                        if comb_prepped is None:
-                            comb_prepped = prepare_comb_input(pt, eta, phi, e, px, py, pz, mask)
-                        comb_norm, comb_raw, _spher_6j, top6_idx = comb_prepped
                         comb_in = comb_norm if model_cfg["normalized"] else comb_raw
                         t1_6, t2_6 = run_comb_solver(session, comb_in)
-                        # Remap 6-jet indices → original padded-jet indices
-                        rows   = np.arange(n_chunk)[:, None]
-                        t1_idx = top6_idx[rows, t1_6]  # (N, 3)
-                        t2_idx = top6_idx[rows, t2_6]  # (N, 3)
+
+                    # Remap 6-jet indices → indices into the original full jet array
+                    t1_idx = top6_idx[rows6, t1_6]  # (N, 3)
+                    t2_idx = top6_idx[rows6, t2_6]  # (N, 3)
 
                     pt1, eta1, phi1, m1 = candidate_fourvec(pt, eta, phi, e, t1_idx)
                     pt2, eta2, phi2, m2 = candidate_fourvec(pt, eta, phi, e, t2_idx)
