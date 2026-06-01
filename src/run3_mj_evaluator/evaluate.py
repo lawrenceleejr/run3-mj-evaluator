@@ -345,18 +345,12 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
                 out_record = {}
 
                 # Pass through all original top-level branches. The nested
-                # ScoutingPFJet record is exploded into separate top-level jagged
-                # arrays (ScoutingPFJet_pt, _eta, ...) so uproot writes each as a
-                # std::vector<T> branch rather than a NanoAOD-style record sharing
-                # an nScoutingPFJet counter.
+                # ScoutingPFJet record is written as a single branch so all jet
+                # fields share one nScoutingPFJet counter rather than emitting
+                # a counter per field.
                 print("  Copying input branches...", flush=True)
                 for branch in ak.fields(chunk):
-                    val = chunk[branch]
-                    if branch == _JET_BRANCH and ak.fields(val):
-                        for sub in ak.fields(val):
-                            out_record[f"{branch}_{sub}"] = val[sub]
-                    else:
-                        out_record[branch] = val
+                    out_record[branch] = chunk[branch]
 
                 for model_cfg, session in zip(models, sessions):
                     prefix = _label_to_prefix(model_cfg["label"])
