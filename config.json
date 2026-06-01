@@ -1,0 +1,19 @@
+{
+    "metadata": {
+        "version": "v1"
+    },
+    "models": [
+        {
+            "type":         "spanet",
+            "path":         "models/cart_non_gpu2v20.onnx",
+            "label":        "SPANet",
+            "input_format": "cart"
+        },
+        {
+            "type":       "comb_solver",
+            "path":       "models/best_model.onnx",
+            "label":      "CombSolver",
+            "normalized": true
+        }
+    ]
+}
