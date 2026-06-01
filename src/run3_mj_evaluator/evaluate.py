@@ -344,11 +344,17 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
 
                 out_record = {}
 
-                # Pass through all original top-level branches (preserves nested
-                # ScoutingPFJet struct from the slimmer).
+                # Pass through all original top-level branches. ak.zip rebuilds
+                # ScoutingPFJet as a jagged-of-record (shared outer offsets) so
+                # uproot emits a single nScoutingPFJet counter instead of one
+                # counter per field.
                 print("  Copying input branches...", flush=True)
                 for branch in ak.fields(chunk):
-                    out_record[branch] = chunk[branch]
+                    val = chunk[branch]
+                    if branch == _JET_BRANCH and ak.fields(val):
+                        out_record[branch] = ak.zip({f: val[f] for f in ak.fields(val)})
+                    else:
+                        out_record[branch] = val
 
                 for model_cfg, session in zip(models, sessions):
                     prefix = _label_to_prefix(model_cfg["label"])
@@ -374,14 +380,19 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
                     pt1, eta1, phi1, m1 = candidate_fourvec(pt, eta, phi, e, t1_idx)
                     pt2, eta2, phi2, m2 = candidate_fourvec(pt, eta, phi, e, t2_idx)
 
-                    # Store as (N, 2) fixed-size arrays: index 0 = candidate 1, index 1 = candidate 2
-                    out_record[f"{prefix}Candidate_pt"]      = ak.Array(np.stack([pt1,          pt2         ], axis=1).astype(np.float32))
-                    out_record[f"{prefix}Candidate_eta"]     = ak.Array(np.stack([eta1,         eta2        ], axis=1).astype(np.float32))
-                    out_record[f"{prefix}Candidate_phi"]     = ak.Array(np.stack([phi1,         phi2        ], axis=1).astype(np.float32))
-                    out_record[f"{prefix}Candidate_mass"]    = ak.Array(np.stack([m1,           m2          ], axis=1).astype(np.float32))
-                    out_record[f"{prefix}Candidate_jetIdx0"] = ak.Array(np.stack([t1_idx[:, 0], t2_idx[:, 0]], axis=1).astype(np.int32))
-                    out_record[f"{prefix}Candidate_jetIdx1"] = ak.Array(np.stack([t1_idx[:, 1], t2_idx[:, 1]], axis=1).astype(np.int32))
-                    out_record[f"{prefix}Candidate_jetIdx2"] = ak.Array(np.stack([t1_idx[:, 2], t2_idx[:, 2]], axis=1).astype(np.int32))
+                    # Store as (N, 2) fixed-size arrays: index 0 = candidate 1, index 1 = candidate 2.
+                    # ak.to_regular forces the inner axis to be a regular (fixed-size)
+                    # dimension so uproot writes it as branch[2] without an n<branch> counter.
+                    def _reg2(a):
+                        return ak.to_regular(ak.Array(a), axis=1)
+
+                    out_record[f"{prefix}Candidate_pt"]      = _reg2(np.stack([pt1,          pt2         ], axis=1).astype(np.float32))
+                    out_record[f"{prefix}Candidate_eta"]     = _reg2(np.stack([eta1,         eta2        ], axis=1).astype(np.float32))
+                    out_record[f"{prefix}Candidate_phi"]     = _reg2(np.stack([phi1,         phi2        ], axis=1).astype(np.float32))
+                    out_record[f"{prefix}Candidate_mass"]    = _reg2(np.stack([m1,           m2          ], axis=1).astype(np.float32))
+                    out_record[f"{prefix}Candidate_jetIdx0"] = _reg2(np.stack([t1_idx[:, 0], t2_idx[:, 0]], axis=1).astype(np.int32))
+                    out_record[f"{prefix}Candidate_jetIdx1"] = _reg2(np.stack([t1_idx[:, 1], t2_idx[:, 1]], axis=1).astype(np.int32))
+                    out_record[f"{prefix}Candidate_jetIdx2"] = _reg2(np.stack([t1_idx[:, 2], t2_idx[:, 2]], axis=1).astype(np.int32))
 
                 total_out += n_chunk
 
