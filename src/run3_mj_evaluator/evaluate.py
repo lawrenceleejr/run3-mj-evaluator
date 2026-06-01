@@ -103,15 +103,15 @@ def _mask_from_lengths(lengths, max_len):
 
 def chunk_to_numpy(chunk):
     """Convert one uproot chunk to padded (N, J) float64 arrays + bool mask."""
-    pt_branch = f"{_JET_BRANCH}_pt"
-    n_jets = ak.to_numpy(ak.num(chunk[pt_branch], axis=1))
+    jets   = chunk[_JET_BRANCH]
+    n_jets = ak.to_numpy(ak.num(jets["pt"], axis=1))
     max_j  = int(n_jets.max()) if len(n_jets) > 0 else 0
 
     mask = _mask_from_lengths(n_jets, max_j)
-    pt   = _padded(chunk[f"{_JET_BRANCH}_pt"],  max_j)
-    eta  = _padded(chunk[f"{_JET_BRANCH}_eta"], max_j)
-    phi  = _padded(chunk[f"{_JET_BRANCH}_phi"], max_j)
-    m    = _padded(chunk[f"{_JET_BRANCH}_m"],   max_j)
+    pt   = _padded(jets["pt"],  max_j)
+    eta  = _padded(jets["eta"], max_j)
+    phi  = _padded(jets["phi"], max_j)
+    m    = _padded(jets["m"],   max_j)
 
     px = pt * np.cos(phi)
     py = pt * np.sin(phi)
@@ -273,10 +273,16 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
 
     print(f"Input:   {input_path}  (tree: {in_tree_name})")
     print(f"Output:  {output_path}")
+    print(f"Version: {version}")
     print(f"Models:  {[m['label'] for m in models]}")
+    print()
 
     print("Loading ONNX sessions...")
-    sessions = [_load_session(m["path"]) for m in models]
+    sessions = []
+    for m in models:
+        print(f"  {m['label']} ({m['type']})  <-  {m['path']}")
+        sessions.append(_load_session(m["path"]))
+    print()
 
     with uproot.open(input_path) as in_file:
         if in_tree_name not in in_file:
@@ -288,21 +294,37 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
         tree      = in_file[in_tree_name]
         tree_keys = set(tree.keys())
 
-        if f"{_JET_BRANCH}_pt" not in tree_keys:
-            sys.exit(f"Branch '{_JET_BRANCH}_pt' not found in tree '{in_tree_name}'.")
+        # The slimmer writes a nested ScoutingPFJet struct; its sub-branches
+        # appear in tree.keys() as "ScoutingPFJet.pt", "ScoutingPFJet.eta", …
+        if f"{_JET_BRANCH}.pt" not in tree_keys:
+            sys.exit(
+                f"Expected nested branch '{_JET_BRANCH}.pt' not found in tree "
+                f"'{in_tree_name}'. Available keys: {sorted(tree_keys)[:20]}"
+            )
+
+        total_entries = tree.num_entries
+        n_chunks      = max(1, (total_entries + chunk_size - 1) // chunk_size)
+        print(f"Tree has {total_entries:,} events -> {n_chunks} chunk(s) of up to {chunk_size:,}")
+        print()
 
         total_in = total_out = 0
 
         with uproot.recreate(output_path) as out_file:
-            out_tree = None
+            out_tree  = None
+            chunk_num = 0
 
             for chunk in tree.iterate(library="ak", step_size=chunk_size):
-                n_chunk   = len(chunk)
-                total_in += n_chunk
+                chunk_num += 1
+                n_chunk    = len(chunk)
+                total_in  += n_chunk
+                print(
+                    f"[{chunk_num}/{n_chunks}] Chunk of {n_chunk:,} events"
+                    f"  (running total: {total_in:,}/{total_entries:,})"
+                )
 
+                print("  Converting branches to numpy arrays...", flush=True)
                 pt, eta, phi, px, py, pz, e, mask = chunk_to_numpy(chunk)
 
-                comb_prepped = None
                 # CombSolver uses the top-7 pT jets; SPANet uses the top-6 (first 6
                 # of the same sorted list). Compute once and share across all models.
                 comb_norm, comb_raw, _spher_7j, top7_idx = prepare_comb_input(
@@ -322,13 +344,17 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
 
                 out_record = {}
 
-                # Pass through all original branches
-                for branch in tree.keys():
+                # Pass through all original top-level branches (preserves nested
+                # ScoutingPFJet struct from the slimmer).
+                print("  Copying input branches...", flush=True)
+                for branch in ak.fields(chunk):
                     out_record[branch] = chunk[branch]
 
                 for model_cfg, session in zip(models, sessions):
                     prefix = _label_to_prefix(model_cfg["label"])
                     mtype  = model_cfg["type"]
+
+                    print(f"  Running {model_cfg['label']} ({mtype})...", flush=True)
 
                     if mtype == "spanet":
                         if model_cfg["input_format"] == "cart":
@@ -359,6 +385,7 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
 
                 total_out += n_chunk
 
+                print(f"  Writing {n_chunk:,} events to output...", flush=True)
                 if out_tree is None:
                     out_file.mktree(
                         "events",
@@ -366,8 +393,8 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
                     )
                     out_tree = out_file["events"]
                 out_tree.extend(out_record)
-
-                print(f"  {total_in:>10,} events processed", end="\r")
+                print(f"  Chunk {chunk_num}/{n_chunks} complete.")
+                print()
 
             # Version histogram (StrCategory is the only reliable way to store
             # strings in uproot; byte-string TTree branches trigger RNTuple routing).
@@ -377,9 +404,10 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
 
             # Pass through cutflow histogram if present
             if "cutflow" in in_file:
+                print("Copying cutflow histogram from input...")
                 out_file["cutflow"] = in_file["cutflow"]
 
-    print(f"\nDone.  {total_in:,} events processed -> {total_out:,} written.")
+    print(f"Done.  {total_in:,} events processed -> {total_out:,} written.")
 
 
 # ---------------------------------------------------------------------------
