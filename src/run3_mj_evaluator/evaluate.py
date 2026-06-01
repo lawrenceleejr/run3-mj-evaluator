@@ -302,20 +302,21 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
 
                 pt, eta, phi, px, py, pz, e, mask = chunk_to_numpy(chunk)
 
-                # Both model types operate on the leading 6 pT jets.
-                # Select them once per chunk and share across all models.
-                comb_norm, comb_raw, _spher_6j, top6_idx = prepare_comb_input(
+                # CombSolver uses the top-7 pT jets; SPANet uses the top-6 (first 6
+                # of the same sorted list). Compute once and share across all models.
+                comb_norm, comb_raw, _spher_7j, top7_idx = prepare_comb_input(
                     pt, eta, phi, e, px, py, pz, mask
                 )
-                rows6 = np.arange(n_chunk)[:, None]
-                pt6   = pt [rows6, top6_idx]
-                eta6  = eta[rows6, top6_idx]
-                phi6  = phi[rows6, top6_idx]
-                e6    = e  [rows6, top6_idx]
-                px6   = px [rows6, top6_idx]
-                py6   = py [rows6, top6_idx]
-                pz6   = pz [rows6, top6_idx]
-                # Slimmer guarantees ≥6 jets, so mask is all-True for the top-6 window.
+                rows7    = np.arange(n_chunk)[:, None]
+                top6_idx = top7_idx[:, :6]  # top-6 is a subset of top-7
+                pt6  = pt [rows7, top6_idx]
+                eta6 = eta[rows7, top6_idx]
+                phi6 = phi[rows7, top6_idx]
+                e6   = e  [rows7, top6_idx]
+                px6  = px [rows7, top6_idx]
+                py6  = py [rows7, top6_idx]
+                pz6  = pz [rows7, top6_idx]
+                # Slimmer guarantees ≥6 jets, so the top-6 mask is all-True.
                 mask6 = np.ones((n_chunk, 6), dtype=bool)
 
                 out_record = {}
@@ -334,17 +335,14 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
                         else:
                             source = np.stack([pt6, eta6, phi6, e6], axis=-1).astype(np.float32)
                         t1_6, t2_6 = run_spanet(session, source, mask6)
+                        t1_idx = top6_idx[rows7, t1_6]  # (N, 3) into full jet array
+                        t2_idx = top6_idx[rows7, t2_6]
 
                     elif mtype == "comb_solver":
-                        if comb_prepped is None:
-                            comb_prepped = prepare_comb_input(pt, eta, phi, e, px, py, pz, mask)
-                        comb_norm, comb_raw, _spher_7j, top7_idx = comb_prepped
                         comb_in = comb_norm if model_cfg["normalized"] else comb_raw
                         t1_7, t2_7 = run_comb_solver(session, comb_in)
-                        # Remap 7-jet indices → original padded-jet indices
-                        rows   = np.arange(n_chunk)[:, None]
-                        t1_idx = top7_idx[rows, t1_7]  # (N, 3)
-                        t2_idx = top7_idx[rows, t2_7]  # (N, 3)
+                        t1_idx = top7_idx[rows7, t1_7]  # (N, 3) into full jet array
+                        t2_idx = top7_idx[rows7, t2_7]
 
                     pt1, eta1, phi1, m1 = candidate_fourvec(pt, eta, phi, e, t1_idx)
                     pt2, eta2, phi2, m2 = candidate_fourvec(pt, eta, phi, e, t2_idx)

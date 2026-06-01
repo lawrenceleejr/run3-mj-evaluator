@@ -4,10 +4,10 @@
     },
     "models": [
         {
-            "type":         "spanet",
-            "path":         "models/cart_non_gpu2v20.onnx",
-            "label":        "SPANet",
-            "input_format": "cart"
+            "type":         "comb_solver",
+            "path":         "models/ml_model_final_20260429_210049_59fe174.onnx",
+            "label":        "CombSolver",
+            "normalized": true 
         }
     ]
 }
