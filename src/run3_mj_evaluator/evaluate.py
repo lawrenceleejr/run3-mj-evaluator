@@ -51,8 +51,9 @@ import numpy as np
 import onnxruntime
 import uproot
 
-_JET_BRANCH     = "ScoutingPFJet"
-_GEN_JET_BRANCH = "GenJet"
+_JET_BRANCH      = "ScoutingPFJet"
+_GEN_JET_BRANCH  = "GenJet"
+_GEN_PART_BRANCH = "GenPart"
 
 _VALID_TYPES   = {"spanet", "comb_solver"}
 _VALID_FORMATS = {"cart", "spher"}
@@ -676,11 +677,11 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
                     )
 
                 # Pass through all original top-level branches, regrouping any
-                # flat ScoutingPFJet_*/GenJet_* layout into a single nested
-                # record so the output is layout-independent.
+                # flat ScoutingPFJet_*/GenJet_*/GenPart_* layout into a single
+                # nested record so the output is layout-independent.
                 with _Timer("Copying input branches"):
                     out_record = _passthrough_branches(
-                        chunk, [_JET_BRANCH, _GEN_JET_BRANCH]
+                        chunk, [_JET_BRANCH, _GEN_JET_BRANCH, _GEN_PART_BRANCH]
                     )
                     print(f"    {len(out_record)} input branches passed through", flush=True)
 
