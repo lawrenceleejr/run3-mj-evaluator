@@ -417,10 +417,24 @@ def candidate_fourvec(pt, eta, phi, e, indices):
 # ---------------------------------------------------------------------------
 
 def _load_session(model_path):
+    # On a Condor slot the cgroup exposes only a subset of the node's cores, so
+    # onnxruntime's default (one thread per logical core, pinned via
+    # pthread_setaffinity_np) floods the log with affinity errors and
+    # oversubscribes the slot. Pin the thread counts explicitly -- this both
+    # silences the affinity calls and matches the requested CPUs. Honour
+    # ORT_NUM_THREADS / OMP_NUM_THREADS if set, else default to 1 (the
+    # comb_solver runs one event at a time, so intra-op threads buy little).
+    n_threads = int(os.environ.get("ORT_NUM_THREADS")
+                    or os.environ.get("OMP_NUM_THREADS")
+                    or 1)
+    opts = onnxruntime.SessionOptions()
+    opts.intra_op_num_threads = n_threads
+    opts.inter_op_num_threads = n_threads
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         return onnxruntime.InferenceSession(
             model_path,
+            sess_options=opts,
             providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
         )
 
