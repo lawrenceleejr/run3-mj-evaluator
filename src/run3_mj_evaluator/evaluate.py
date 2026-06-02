@@ -88,6 +88,56 @@ def _label_to_prefix(label):
 
 
 # ---------------------------------------------------------------------------
+# Jet sub-branch access (nested vs flat layout)
+# ---------------------------------------------------------------------------
+
+def jet_format(keys):
+    """Determine how the jet kinematics are stored in a set of *tree* keys.
+
+    uproot reports a tree's branches with dotted names, so the two supported
+    layouts are distinguishable directly:
+      - "nested": a single ScoutingPFJet record whose sub-branches show up as
+        ``ScoutingPFJet.pt``, ``ScoutingPFJet.eta``, … (dotted).
+      - "flat":   NanoAOD-style separate branches ``ScoutingPFJet_pt``,
+        ``ScoutingPFJet_eta``, … (underscored).
+
+    Returns "nested", "flat", or None if neither is present.
+    """
+    keys = set(keys)
+    if f"{_JET_BRANCH}.pt" in keys:
+        return "nested"
+    if f"{_JET_BRANCH}_pt" in keys:
+        return "flat"
+    return None
+
+
+def jet_subarrays(chunk):
+    """Return (pt, eta, phi, m) jagged awkward arrays for the jets.
+
+    Handles both the nested ScoutingPFJet record and the flat
+    ``ScoutingPFJet_<field>`` layout transparently. Detection is based on the
+    chunk's own structure: in the nested layout ``ScoutingPFJet`` is a single
+    record field, whereas in the flat layout the kinematics are separate
+    top-level fields ``ScoutingPFJet_pt`` etc.
+    """
+    fields = set(ak.fields(chunk))
+    if _JET_BRANCH in fields and ak.fields(chunk[_JET_BRANCH]):
+        jets = chunk[_JET_BRANCH]
+        return jets["pt"], jets["eta"], jets["phi"], jets["m"]
+    if f"{_JET_BRANCH}_pt" in fields:
+        return (
+            chunk[f"{_JET_BRANCH}_pt"],
+            chunk[f"{_JET_BRANCH}_eta"],
+            chunk[f"{_JET_BRANCH}_phi"],
+            chunk[f"{_JET_BRANCH}_m"],
+        )
+    raise KeyError(
+        f"Could not find jet branches '{_JET_BRANCH}.pt' (nested) or "
+        f"'{_JET_BRANCH}_pt' (flat) in chunk fields: {sorted(fields)}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Jagged → padded numpy helpers
 # ---------------------------------------------------------------------------
 
@@ -103,15 +153,15 @@ def _mask_from_lengths(lengths, max_len):
 
 def chunk_to_numpy(chunk):
     """Convert one uproot chunk to padded (N, J) float64 arrays + bool mask."""
-    jets   = chunk[_JET_BRANCH]
-    n_jets = ak.to_numpy(ak.num(jets["pt"], axis=1))
+    jet_pt, jet_eta, jet_phi, jet_m = jet_subarrays(chunk)
+    n_jets = ak.to_numpy(ak.num(jet_pt, axis=1))
     max_j  = int(n_jets.max()) if len(n_jets) > 0 else 0
 
     mask = _mask_from_lengths(n_jets, max_j)
-    pt   = _padded(jets["pt"],  max_j)
-    eta  = _padded(jets["eta"], max_j)
-    phi  = _padded(jets["phi"], max_j)
-    m    = _padded(jets["m"],   max_j)
+    pt   = _padded(jet_pt,  max_j)
+    eta  = _padded(jet_eta, max_j)
+    phi  = _padded(jet_phi, max_j)
+    m    = _padded(jet_m,   max_j)
 
     px = pt * np.cos(phi)
     py = pt * np.sin(phi)
@@ -294,13 +344,17 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
         tree      = in_file[in_tree_name]
         tree_keys = set(tree.keys())
 
-        # The slimmer writes a nested ScoutingPFJet struct; its sub-branches
-        # appear in tree.keys() as "ScoutingPFJet.pt", "ScoutingPFJet.eta", …
-        if f"{_JET_BRANCH}.pt" not in tree_keys:
+        # Jet kinematics may be stored either as a nested ScoutingPFJet record
+        # ("ScoutingPFJet.pt", …) or as flat NanoAOD-style branches
+        # ("ScoutingPFJet_pt", …). Accept whichever the input uses.
+        fmt = jet_format(tree_keys)
+        if fmt is None:
             sys.exit(
-                f"Expected nested branch '{_JET_BRANCH}.pt' not found in tree "
+                f"Expected jet branch '{_JET_BRANCH}.pt' (nested) or "
+                f"'{_JET_BRANCH}_pt' (flat) not found in tree "
                 f"'{in_tree_name}'. Available keys: {sorted(tree_keys)[:20]}"
             )
+        print(f"Jet layout: {fmt} ('{_JET_BRANCH}{'.' if fmt == 'nested' else '_'}pt')")
 
         total_entries = tree.num_entries
         n_chunks      = max(1, (total_entries + chunk_size - 1) // chunk_size)
@@ -347,14 +401,31 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
                 # Pass through all original top-level branches. ak.zip rebuilds
                 # ScoutingPFJet as a jagged-of-record (shared outer offsets) so
                 # uproot emits a single nScoutingPFJet counter instead of one
-                # counter per field.
+                # counter per field. This is applied for both input layouts:
+                #   - nested input already exposes a ScoutingPFJet record;
+                #   - flat input (ScoutingPFJet_pt, …) is regrouped here so the
+                #     output stays single-countered and layout-independent.
                 print("  Copying input branches...", flush=True)
+                flat_jet_fields = [
+                    f for f in ak.fields(chunk) if f.startswith(f"{_JET_BRANCH}_")
+                ]
                 for branch in ak.fields(chunk):
                     val = chunk[branch]
                     if branch == _JET_BRANCH and ak.fields(val):
                         out_record[branch] = ak.zip({f: val[f] for f in ak.fields(val)})
+                    elif flat_jet_fields and branch == f"n{_JET_BRANCH}":
+                        # Redundant standalone counter for the flat layout; uproot
+                        # regenerates it from the regrouped record below.
+                        continue
+                    elif branch in flat_jet_fields:
+                        # Collected into the zipped record after the loop.
+                        continue
                     else:
                         out_record[branch] = val
+                if flat_jet_fields:
+                    out_record[_JET_BRANCH] = ak.zip(
+                        {f[len(_JET_BRANCH) + 1:]: chunk[f] for f in flat_jet_fields}
+                    )
 
                 for model_cfg, session in zip(models, sessions):
                     prefix = _label_to_prefix(model_cfg["label"])
