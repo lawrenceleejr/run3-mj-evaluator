@@ -21,9 +21,13 @@ import os
 import sys
 
 
-# Default redirector: LPC XCache (fastest on LPCFNAL worker nodes).
-# Use root://cmsxrootd.fnal.gov/ for global CMS access.
-DEFAULT_REDIRECTOR = "root://xcache/"
+# Default redirector: LPC EOS. The evaluator's inputs are the slimmer's
+# outputs, which live in personal/group EOS (/store/group/..., /store/user/...)
+# and must be read through the EOS redirector. XCache (root://xcache/) only
+# serves the globally-distributed CMS namespace and is not resolvable for these
+# files -- it yields "[FATAL] Invalid address". Use root://cmsxrootd.fnal.gov/
+# for global CMS access if you ever point this at official datasets.
+DEFAULT_REDIRECTOR = "root://cmseos.fnal.gov/"
 
 
 def dataset_name(txt_path: str) -> str:
