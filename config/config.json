@@ -8,6 +8,13 @@
             "path":         "models/ml_model_final_20260505_165042_5e8067a.onnx",
             "label":        "CombSolver",
             "normalized": true 
+        },
+        {
+            "type":         "comb_solver",
+            "path":         "models/classical_mass_asymmetry_final_20260505_165042_5e8067a.onnx",
+            "label":        "Mass Asymmetry",
+            "normalized": true 
         }
+
     ]
 }
