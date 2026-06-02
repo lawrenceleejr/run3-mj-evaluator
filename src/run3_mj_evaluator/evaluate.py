@@ -401,14 +401,31 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
                 # Pass through all original top-level branches. ak.zip rebuilds
                 # ScoutingPFJet as a jagged-of-record (shared outer offsets) so
                 # uproot emits a single nScoutingPFJet counter instead of one
-                # counter per field.
+                # counter per field. This is applied for both input layouts:
+                #   - nested input already exposes a ScoutingPFJet record;
+                #   - flat input (ScoutingPFJet_pt, …) is regrouped here so the
+                #     output stays single-countered and layout-independent.
                 print("  Copying input branches...", flush=True)
+                flat_jet_fields = [
+                    f for f in ak.fields(chunk) if f.startswith(f"{_JET_BRANCH}_")
+                ]
                 for branch in ak.fields(chunk):
                     val = chunk[branch]
                     if branch == _JET_BRANCH and ak.fields(val):
                         out_record[branch] = ak.zip({f: val[f] for f in ak.fields(val)})
+                    elif flat_jet_fields and branch == f"n{_JET_BRANCH}":
+                        # Redundant standalone counter for the flat layout; uproot
+                        # regenerates it from the regrouped record below.
+                        continue
+                    elif branch in flat_jet_fields:
+                        # Collected into the zipped record after the loop.
+                        continue
                     else:
                         out_record[branch] = val
+                if flat_jet_fields:
+                    out_record[_JET_BRANCH] = ak.zip(
+                        {f[len(_JET_BRANCH) + 1:]: chunk[f] for f in flat_jet_fields}
+                    )
 
                 for model_cfg, session in zip(models, sessions):
                     prefix = _label_to_prefix(model_cfg["label"])
