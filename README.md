@@ -17,7 +17,16 @@ ScoutingNanoAOD ROOT  →  slim.py  →  slimmed ROOT  →  evaluate.py  →  ev
 ```bash
 python evaluate.py input.root output.root config.json
 python evaluate.py input.root output.root config.json --tree events --chunk-size 50000
+python evaluate.py mc.root output.root config.json --run-on-genjets
 ```
+
+### Optional flags
+
+| Flag | Description |
+|---|---|
+| `--tree NAME` | Input TTree name (default: `events`). |
+| `--chunk-size N` | Events per processing chunk (default: `50000`). |
+| `--run-on-genjets` | Also run every configured model on the `GenJet` collection (MC only). See [GenJet support](#genjet-support-mc) below. |
 
 ## Config format
 
@@ -68,6 +77,33 @@ each model in the config:
 Each array has two elements per event: `[0]` = candidate 1, `[1]` = candidate 2.
 The jet indices point into the per-event `ScoutingPFJet_*` arrays so you can
 recover the constituent jet kinematics.
+
+## GenJet support (MC)
+
+If the input file contains a `GenJet` collection (nested `GenJet.pt` or flat
+`GenJet_pt`/etc.), it is **always passed through** to the output unchanged —
+no flag required. As with `ScoutingPFJet`, a flat layout is regrouped into a
+single nested `GenJet` record on output (one shared offset counter).
+
+Passing `--run-on-genjets` additionally runs every configured model a second
+time using the `GenJet` 4-vectors as input. For each model this writes an
+extra block of branches alongside the reco ones:
+
+| Branch | Description |
+|---|---|
+| `{label}GenCandidate_pt[2]`, `_eta[2]`, `_phi[2]`, `_mass[2]` | Trijet candidates reconstructed from GenJets |
+| `{label}GenCandidate_jetIdx0[2]`, `_jetIdx1[2]`, `_jetIdx2[2]` | Indices into the per-event `GenJet_*` arrays |
+
+This is useful for truth-level closure tests and for comparing the model's
+behaviour on parton-level vs. detector-level jets.
+
+Notes:
+- `--run-on-genjets` requires a `GenJet` collection in the input; the run
+  aborts otherwise.
+- Events with fewer than 7 GenJets are still processed (the input is padded
+  with zero 4-vectors and the SPANet mask is set correctly), but indices and
+  candidate kinematics for those events may not be physically meaningful —
+  filter on GenJet multiplicity downstream if needed.
 
 ### `meta` TTree
 

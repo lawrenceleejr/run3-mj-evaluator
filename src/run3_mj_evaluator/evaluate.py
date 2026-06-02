@@ -3,15 +3,19 @@
 
 Reads a slimmed ROOT file (produced by slim.py), runs one or more ONNX models
 on per-event jet 4-vectors, and writes a new ROOT file containing:
-  - All original branches (pass-through)
+  - All original branches (pass-through), including a GenJet collection if the
+    input is MC and contains one.
   - For each model: {label}Candidate_pt[2], eta[2], phi[2], mass[2],
-    jetIdx0[2], jetIdx1[2], jetIdx2[2]  — the two predicted trijet particles
+    jetIdx0[2], jetIdx1[2], jetIdx2[2]  — the two predicted trijet particles.
+  - With --run-on-genjets: additional {label}GenCandidate_* branches produced
+    by running each model on the GenJet collection (indices point into GenJet).
   - TH1 'version': config metadata.version string
   - TH1 'cutflow': passed through from the input file if present
 
 Usage:
     python evaluate.py input.root output.root config.json
     python evaluate.py input.root output.root config.json --tree events --chunk-size 50000
+    python evaluate.py mc.root out.root config.json --run-on-genjets
 
 Config JSON format:
     {
@@ -45,7 +49,8 @@ import numpy as np
 import onnxruntime
 import uproot
 
-_JET_BRANCH = "ScoutingPFJet"
+_JET_BRANCH     = "ScoutingPFJet"
+_GEN_JET_BRANCH = "GenJet"
 
 _VALID_TYPES   = {"spanet", "comb_solver"}
 _VALID_FORMATS = {"cart", "spher"}
@@ -91,49 +96,46 @@ def _label_to_prefix(label):
 # Jet sub-branch access (nested vs flat layout)
 # ---------------------------------------------------------------------------
 
-def jet_format(keys):
+def jet_format(keys, branch=_JET_BRANCH):
     """Determine how the jet kinematics are stored in a set of *tree* keys.
 
     uproot reports a tree's branches with dotted names, so the two supported
     layouts are distinguishable directly:
-      - "nested": a single ScoutingPFJet record whose sub-branches show up as
-        ``ScoutingPFJet.pt``, ``ScoutingPFJet.eta``, … (dotted).
-      - "flat":   NanoAOD-style separate branches ``ScoutingPFJet_pt``,
-        ``ScoutingPFJet_eta``, … (underscored).
+      - "nested": a single ``<branch>`` record whose sub-branches show up as
+        ``<branch>.pt``, ``<branch>.eta``, … (dotted).
+      - "flat":   NanoAOD-style separate branches ``<branch>_pt``,
+        ``<branch>_eta``, … (underscored).
 
     Returns "nested", "flat", or None if neither is present.
     """
     keys = set(keys)
-    if f"{_JET_BRANCH}.pt" in keys:
+    if f"{branch}.pt" in keys:
         return "nested"
-    if f"{_JET_BRANCH}_pt" in keys:
+    if f"{branch}_pt" in keys:
         return "flat"
     return None
 
 
-def jet_subarrays(chunk):
-    """Return (pt, eta, phi, m) jagged awkward arrays for the jets.
+def jet_subarrays(chunk, branch=_JET_BRANCH):
+    """Return (pt, eta, phi, m) jagged awkward arrays for the given collection.
 
-    Handles both the nested ScoutingPFJet record and the flat
-    ``ScoutingPFJet_<field>`` layout transparently. Detection is based on the
-    chunk's own structure: in the nested layout ``ScoutingPFJet`` is a single
-    record field, whereas in the flat layout the kinematics are separate
-    top-level fields ``ScoutingPFJet_pt`` etc.
+    Handles both the nested ``<branch>`` record and the flat ``<branch>_<field>``
+    layout transparently.
     """
     fields = set(ak.fields(chunk))
-    if _JET_BRANCH in fields and ak.fields(chunk[_JET_BRANCH]):
-        jets = chunk[_JET_BRANCH]
+    if branch in fields and ak.fields(chunk[branch]):
+        jets = chunk[branch]
         return jets["pt"], jets["eta"], jets["phi"], jets["m"]
-    if f"{_JET_BRANCH}_pt" in fields:
+    if f"{branch}_pt" in fields:
         return (
-            chunk[f"{_JET_BRANCH}_pt"],
-            chunk[f"{_JET_BRANCH}_eta"],
-            chunk[f"{_JET_BRANCH}_phi"],
-            chunk[f"{_JET_BRANCH}_m"],
+            chunk[f"{branch}_pt"],
+            chunk[f"{branch}_eta"],
+            chunk[f"{branch}_phi"],
+            chunk[f"{branch}_m"],
         )
     raise KeyError(
-        f"Could not find jet branches '{_JET_BRANCH}.pt' (nested) or "
-        f"'{_JET_BRANCH}_pt' (flat) in chunk fields: {sorted(fields)}"
+        f"Could not find jet branches '{branch}.pt' (nested) or "
+        f"'{branch}_pt' (flat) in chunk fields: {sorted(fields)}"
     )
 
 
@@ -151,11 +153,16 @@ def _mask_from_lengths(lengths, max_len):
     return np.arange(max_len)[None, :] < np.asarray(lengths)[:, None]
 
 
-def chunk_to_numpy(chunk):
-    """Convert one uproot chunk to padded (N, J) float64 arrays + bool mask."""
-    jet_pt, jet_eta, jet_phi, jet_m = jet_subarrays(chunk)
+def chunk_to_numpy(chunk, branch=_JET_BRANCH, min_jets=0):
+    """Convert one uproot chunk to padded (N, J) float64 arrays + bool mask.
+
+    ``min_jets`` forces the padded width to be at least that many slots, so
+    downstream code that always expects e.g. 7 jets (CombSolver) works even on
+    sparse collections like GenJet where some events have fewer entries.
+    """
+    jet_pt, jet_eta, jet_phi, jet_m = jet_subarrays(chunk, branch)
     n_jets = ak.to_numpy(ak.num(jet_pt, axis=1))
-    max_j  = int(n_jets.max()) if len(n_jets) > 0 else 0
+    max_j  = max(min_jets, int(n_jets.max()) if len(n_jets) > 0 else 0)
 
     mask = _mask_from_lengths(n_jets, max_j)
     pt   = _padded(jet_pt,  max_j)
@@ -314,10 +321,126 @@ def _load_session(model_path):
 
 
 # ---------------------------------------------------------------------------
+# Per-collection model dispatch
+# ---------------------------------------------------------------------------
+
+def _evaluate_collection(
+    models, sessions, pt, eta, phi, e, px, py, pz, mask, candidate_infix,
+):
+    """Run every (model, session) pair on one jet collection.
+
+    ``candidate_infix`` is inserted between ``{label}`` and ``Candidate_`` in the
+    output branch names. Use ``""`` for reco (gives ``SPANetCandidate_pt`` etc.)
+    and ``"Gen"`` for the GenJet pass (gives ``SPANetGenCandidate_pt`` etc.).
+    Returns a dict of output branches.
+    """
+    n_chunk = pt.shape[0]
+
+    comb_norm, comb_raw, _spher_7j, top7_idx = prepare_comb_input(
+        pt, eta, phi, e, px, py, pz, mask
+    )
+    rows7    = np.arange(n_chunk)[:, None]
+    top6_idx = top7_idx[:, :6]
+    pt6  = pt [rows7, top6_idx]
+    eta6 = eta[rows7, top6_idx]
+    phi6 = phi[rows7, top6_idx]
+    e6   = e  [rows7, top6_idx]
+    px6  = px [rows7, top6_idx]
+    py6  = py [rows7, top6_idx]
+    pz6  = pz [rows7, top6_idx]
+    # Use the real mask so SPANet ignores padded slots in low-multiplicity events
+    # (e.g. GenJet). For reco, slimmer guarantees ≥6 jets so this is all-True.
+    mask6 = mask[rows7, top6_idx]
+
+    def _reg2(a):
+        return ak.to_regular(ak.Array(a), axis=1)
+
+    out = {}
+    label_for_log = candidate_infix or "reco"
+
+    for model_cfg, session in zip(models, sessions):
+        prefix = _label_to_prefix(model_cfg["label"])
+        mtype  = model_cfg["type"]
+
+        print(f"  Running {model_cfg['label']} ({mtype}) on {label_for_log} jets...", flush=True)
+
+        if mtype == "spanet":
+            if model_cfg["input_format"] == "cart":
+                source = np.stack([px6, py6, pz6, e6], axis=-1).astype(np.float32)
+            else:
+                source = np.stack([pt6, eta6, phi6, e6], axis=-1).astype(np.float32)
+            t1_6, t2_6 = run_spanet(session, source, mask6)
+            t1_idx = top6_idx[rows7, t1_6]
+            t2_idx = top6_idx[rows7, t2_6]
+        elif mtype == "comb_solver":
+            comb_in = comb_norm if model_cfg["normalized"] else comb_raw
+            t1_7, t2_7 = run_comb_solver(session, comb_in)
+            t1_idx = top7_idx[rows7, t1_7]
+            t2_idx = top7_idx[rows7, t2_7]
+
+        pt1, eta1, phi1, m1 = candidate_fourvec(pt, eta, phi, e, t1_idx)
+        pt2, eta2, phi2, m2 = candidate_fourvec(pt, eta, phi, e, t2_idx)
+
+        base = f"{prefix}{candidate_infix}Candidate_"
+        out[f"{base}pt"]      = _reg2(np.stack([pt1,          pt2         ], axis=1).astype(np.float32))
+        out[f"{base}eta"]     = _reg2(np.stack([eta1,         eta2        ], axis=1).astype(np.float32))
+        out[f"{base}phi"]     = _reg2(np.stack([phi1,         phi2        ], axis=1).astype(np.float32))
+        out[f"{base}mass"]    = _reg2(np.stack([m1,           m2          ], axis=1).astype(np.float32))
+        out[f"{base}jetIdx0"] = _reg2(np.stack([t1_idx[:, 0], t2_idx[:, 0]], axis=1).astype(np.int32))
+        out[f"{base}jetIdx1"] = _reg2(np.stack([t1_idx[:, 1], t2_idx[:, 1]], axis=1).astype(np.int32))
+        out[f"{base}jetIdx2"] = _reg2(np.stack([t1_idx[:, 2], t2_idx[:, 2]], axis=1).astype(np.int32))
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Branch pass-through
+# ---------------------------------------------------------------------------
+
+def _passthrough_branches(chunk, regroup_collections):
+    """Build an out_record dict from a chunk, regrouping any flat collection
+    branches in ``regroup_collections`` into a single zipped record.
+
+    For each collection name ``B`` in ``regroup_collections``:
+      - if the chunk has a nested record ``B`` (with sub-fields), re-zip it so
+        uproot emits one shared offset counter;
+      - if the chunk has flat ``B_<field>`` branches, regroup them into a
+        zipped ``B`` record (and drop the standalone ``nB`` counter, which
+        uproot will regenerate).
+    All other branches pass through unchanged.
+    """
+    chunk_fields = ak.fields(chunk)
+    flat_by_collection = {
+        b: [f for f in chunk_fields if f.startswith(f"{b}_")]
+        for b in regroup_collections
+    }
+    all_flat       = {f for fs in flat_by_collection.values() for f in fs}
+    skip_counters  = {f"n{b}" for b, fs in flat_by_collection.items() if fs}
+    nested_targets = set(regroup_collections)
+
+    out_record = {}
+    for branch in chunk_fields:
+        val = chunk[branch]
+        if branch in nested_targets and ak.fields(val):
+            out_record[branch] = ak.zip({f: val[f] for f in ak.fields(val)})
+        elif branch in skip_counters or branch in all_flat:
+            continue
+        else:
+            out_record[branch] = val
+
+    for b, fs in flat_by_collection.items():
+        if fs:
+            out_record[b] = ak.zip({f[len(b) + 1:]: chunk[f] for f in fs})
+
+    return out_record
+
+
+# ---------------------------------------------------------------------------
 # Main evaluation loop
 # ---------------------------------------------------------------------------
 
-def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_size):
+def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_size,
+             run_on_genjets=False):
     models  = config["models"]
     version = config.get("metadata", {}).get("version", "unknown")
 
@@ -356,6 +479,18 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
             )
         print(f"Jet layout: {fmt} ('{_JET_BRANCH}{'.' if fmt == 'nested' else '_'}pt')")
 
+        gen_fmt = jet_format(tree_keys, branch=_GEN_JET_BRANCH)
+        if gen_fmt is not None:
+            print(f"GenJet layout: {gen_fmt} ('{_GEN_JET_BRANCH}{'.' if gen_fmt == 'nested' else '_'}pt') — will pass through")
+        if run_on_genjets and gen_fmt is None:
+            sys.exit(
+                f"--run-on-genjets was requested but no '{_GEN_JET_BRANCH}' "
+                f"collection was found in tree '{in_tree_name}'. This input "
+                "does not look like MC."
+            )
+        if run_on_genjets:
+            print(f"Will also run all models on the {_GEN_JET_BRANCH} collection.")
+
         total_entries = tree.num_entries
         n_chunks      = max(1, (total_entries + chunk_size - 1) // chunk_size)
         print(f"Tree has {total_entries:,} events -> {n_chunks} chunk(s) of up to {chunk_size:,}")
@@ -377,93 +512,34 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
                 )
 
                 print("  Converting branches to numpy arrays...", flush=True)
-                pt, eta, phi, px, py, pz, e, mask = chunk_to_numpy(chunk)
+                # Pad to ≥7 slots so CombSolver always sees (N, 7, 4); reco
+                # already has ≥6 jets thanks to the slimmer, but GenJets may
+                # have fewer in some events.
+                pt, eta, phi, px, py, pz, e, mask = chunk_to_numpy(chunk, min_jets=7)
 
-                # CombSolver uses the top-7 pT jets; SPANet uses the top-6 (first 6
-                # of the same sorted list). Compute once and share across all models.
-                comb_norm, comb_raw, _spher_7j, top7_idx = prepare_comb_input(
-                    pt, eta, phi, e, px, py, pz, mask
-                )
-                rows7    = np.arange(n_chunk)[:, None]
-                top6_idx = top7_idx[:, :6]  # top-6 is a subset of top-7
-                pt6  = pt [rows7, top6_idx]
-                eta6 = eta[rows7, top6_idx]
-                phi6 = phi[rows7, top6_idx]
-                e6   = e  [rows7, top6_idx]
-                px6  = px [rows7, top6_idx]
-                py6  = py [rows7, top6_idx]
-                pz6  = pz [rows7, top6_idx]
-                # Slimmer guarantees ≥6 jets, so the top-6 mask is all-True.
-                mask6 = np.ones((n_chunk, 6), dtype=bool)
-
-                out_record = {}
-
-                # Pass through all original top-level branches. ak.zip rebuilds
-                # ScoutingPFJet as a jagged-of-record (shared outer offsets) so
-                # uproot emits a single nScoutingPFJet counter instead of one
-                # counter per field. This is applied for both input layouts:
-                #   - nested input already exposes a ScoutingPFJet record;
-                #   - flat input (ScoutingPFJet_pt, …) is regrouped here so the
-                #     output stays single-countered and layout-independent.
+                # Pass through all original top-level branches, regrouping any
+                # flat ScoutingPFJet_*/GenJet_* layout into a single nested
+                # record so the output is layout-independent.
                 print("  Copying input branches...", flush=True)
-                flat_jet_fields = [
-                    f for f in ak.fields(chunk) if f.startswith(f"{_JET_BRANCH}_")
-                ]
-                for branch in ak.fields(chunk):
-                    val = chunk[branch]
-                    if branch == _JET_BRANCH and ak.fields(val):
-                        out_record[branch] = ak.zip({f: val[f] for f in ak.fields(val)})
-                    elif flat_jet_fields and branch == f"n{_JET_BRANCH}":
-                        # Redundant standalone counter for the flat layout; uproot
-                        # regenerates it from the regrouped record below.
-                        continue
-                    elif branch in flat_jet_fields:
-                        # Collected into the zipped record after the loop.
-                        continue
-                    else:
-                        out_record[branch] = val
-                if flat_jet_fields:
-                    out_record[_JET_BRANCH] = ak.zip(
-                        {f[len(_JET_BRANCH) + 1:]: chunk[f] for f in flat_jet_fields}
+                out_record = _passthrough_branches(
+                    chunk, [_JET_BRANCH, _GEN_JET_BRANCH]
+                )
+
+                out_record.update(_evaluate_collection(
+                    models, sessions, pt, eta, phi, e, px, py, pz, mask,
+                    candidate_infix="",
+                ))
+
+                if run_on_genjets:
+                    print("  Converting GenJet branches to numpy arrays...", flush=True)
+                    g_pt, g_eta, g_phi, g_px, g_py, g_pz, g_e, g_mask = chunk_to_numpy(
+                        chunk, branch=_GEN_JET_BRANCH, min_jets=7,
                     )
-
-                for model_cfg, session in zip(models, sessions):
-                    prefix = _label_to_prefix(model_cfg["label"])
-                    mtype  = model_cfg["type"]
-
-                    print(f"  Running {model_cfg['label']} ({mtype})...", flush=True)
-
-                    if mtype == "spanet":
-                        if model_cfg["input_format"] == "cart":
-                            source = np.stack([px6, py6, pz6, e6], axis=-1).astype(np.float32)
-                        else:
-                            source = np.stack([pt6, eta6, phi6, e6], axis=-1).astype(np.float32)
-                        t1_6, t2_6 = run_spanet(session, source, mask6)
-                        t1_idx = top6_idx[rows7, t1_6]  # (N, 3) into full jet array
-                        t2_idx = top6_idx[rows7, t2_6]
-
-                    elif mtype == "comb_solver":
-                        comb_in = comb_norm if model_cfg["normalized"] else comb_raw
-                        t1_7, t2_7 = run_comb_solver(session, comb_in)
-                        t1_idx = top7_idx[rows7, t1_7]  # (N, 3) into full jet array
-                        t2_idx = top7_idx[rows7, t2_7]
-
-                    pt1, eta1, phi1, m1 = candidate_fourvec(pt, eta, phi, e, t1_idx)
-                    pt2, eta2, phi2, m2 = candidate_fourvec(pt, eta, phi, e, t2_idx)
-
-                    # Store as (N, 2) fixed-size arrays: index 0 = candidate 1, index 1 = candidate 2.
-                    # ak.to_regular forces the inner axis to be a regular (fixed-size)
-                    # dimension so uproot writes it as branch[2] without an n<branch> counter.
-                    def _reg2(a):
-                        return ak.to_regular(ak.Array(a), axis=1)
-
-                    out_record[f"{prefix}Candidate_pt"]      = _reg2(np.stack([pt1,          pt2         ], axis=1).astype(np.float32))
-                    out_record[f"{prefix}Candidate_eta"]     = _reg2(np.stack([eta1,         eta2        ], axis=1).astype(np.float32))
-                    out_record[f"{prefix}Candidate_phi"]     = _reg2(np.stack([phi1,         phi2        ], axis=1).astype(np.float32))
-                    out_record[f"{prefix}Candidate_mass"]    = _reg2(np.stack([m1,           m2          ], axis=1).astype(np.float32))
-                    out_record[f"{prefix}Candidate_jetIdx0"] = _reg2(np.stack([t1_idx[:, 0], t2_idx[:, 0]], axis=1).astype(np.int32))
-                    out_record[f"{prefix}Candidate_jetIdx1"] = _reg2(np.stack([t1_idx[:, 1], t2_idx[:, 1]], axis=1).astype(np.int32))
-                    out_record[f"{prefix}Candidate_jetIdx2"] = _reg2(np.stack([t1_idx[:, 2], t2_idx[:, 2]], axis=1).astype(np.int32))
+                    out_record.update(_evaluate_collection(
+                        models, sessions,
+                        g_pt, g_eta, g_phi, g_e, g_px, g_py, g_pz, g_mask,
+                        candidate_infix="Gen",
+                    ))
 
                 total_out += n_chunk
 
@@ -515,6 +591,14 @@ def main():
         "--chunk-size", type=int, default=50_000, metavar="N",
         help="Events per processing chunk",
     )
+    parser.add_argument(
+        "--run-on-genjets", action="store_true",
+        help=(
+            "Also run every model on the GenJet collection (requires MC input "
+            "with a GenJet branch). Emits additional {label}GenCandidate_* "
+            "branches whose jet indices point into the GenJet arrays."
+        ),
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -525,6 +609,7 @@ def main():
         config_path=args.config,
         in_tree_name=args.tree,
         chunk_size=args.chunk_size,
+        run_on_genjets=args.run_on_genjets,
     )
 
 
