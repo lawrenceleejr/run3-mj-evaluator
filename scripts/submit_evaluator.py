@@ -220,7 +220,13 @@ class Batch:
                 for filepath, tree in files:
                     tree_name = tree if tree else self.default_tree
                     basename = os.path.basename(filepath)
-                    output = f"evaluated_{name}_{basename}"
+                    # Mirror the slimmed input name, swapping the leading
+                    # "slimmed" for "evaluated":
+                    #   slimmed_<dataset>_<tail>.root -> evaluated_<dataset>_<tail>.root
+                    if basename.startswith("slimmed_"):
+                        output = "evaluated_" + basename[len("slimmed_"):]
+                    else:
+                        output = "evaluated_" + basename
                     run_cmds.append(
                         f"run3-mj-evaluator {filepath} {output} {config_basename}"
                         f" --tree {tree_name}"
